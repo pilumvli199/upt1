@@ -2,24 +2,11 @@
 """
 Upstox -> Telegram LTP poller for Nifty50 members (full)
 
-Features:
-- Optionally loads a list of NIFTY50 tickers (from env or default list)
-- Downloads Upstox instruments CSV (complete.csv.gz) and maps trading_symbol -> instrument_key
-- Polls Upstox v3 LTP endpoint for all instrument_keys every POLL_INTERVAL seconds
-- Sends Telegram updates only when LTP changes (or when CHANGE_THRESHOLD_PCT exceeded)
-- Friendly name mapping, robust parsing, raw response logging (container logs) for debugging
-Env variables (required):
-- UPSTOX_ACCESS_TOKEN
-- TELEGRAM_BOT_TOKEN
-- TELEGRAM_CHAT_ID
-
-Optional env:
-- POLL_INTERVAL (seconds, default 60)
-- CHANGE_THRESHOLD_PCT (0 => any change triggers; default 0.0)
-- NIFTY50_TICKERS (comma separated tickers) - if not set, default list used
-- EXPLICIT_INSTRUMENT_KEYS (comma-separated instrument_key entries you want to include in addition to Nifty50)
-- SEND_ALL_EVERY_POLL (true/false) - if true, send full list every poll even if no change (default false)
-- INSTRUMENT_NAME_MAP (mapping instrument_key:FriendlyName comma-separated)
+Use:
+- Copy this file as main.py
+- Fill .env (see .env.example)
+- pip install requests
+- python main.py
 """
 import os
 import time
@@ -47,9 +34,8 @@ POLL_INTERVAL = int(os.getenv('POLL_INTERVAL') or 60)
 CHANGE_THRESHOLD_PCT = float(os.getenv('CHANGE_THRESHOLD_PCT') or 0.0)
 SEND_ALL_EVERY_POLL = os.getenv('SEND_ALL_EVERY_POLL', 'false').lower() in ('1','true','yes')
 
-# Provide your own tickers or use default below
-NIFTY50_TICKERS_RAW = os.getenv('NIFTY50_TICKERS')  # comma separated e.g. "RELIANCE,TCS,INFY,..."
-EXPLICIT_INSTRUMENT_KEYS = os.getenv('EXPLICIT_INSTRUMENT_KEYS')  # comma separated instrument_key values to include
+NIFTY50_TICKERS_RAW = os.getenv('NIFTY50_TICKERS')  # comma separated trading symbols you want to map
+EXPLICIT_INSTRUMENT_KEYS = os.getenv('EXPLICIT_INSTRUMENT_KEYS')  # comma separated instrument_keys to poll directly
 
 INSTRUMENT_NAME_MAP_RAW = os.getenv('INSTRUMENT_NAME_MAP') or ""  # e.g. "NSE_EQ|INE467B01029:TCS,..."
 
@@ -57,16 +43,14 @@ if not UPSTOX_ACCESS_TOKEN or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     logging.error("Missing required env vars: UPSTOX_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID")
     raise SystemExit(1)
 
-# Default common Nifty50 tickers (best-effort). You can override via NIFTY50_TICKERS env.
+# Default common Nifty50 tickers (best-effort). Override via NIFTY50_TICKERS env if needed.
 DEFAULT_NIFTY50_TICKERS = [
-    "ADANIENT","ASIANPAINT","AXISBANK","BAJAJ-AUTO","BAJFINANCE","BAJAJFINSV","BPCL","BHARTIARTL",
-    "INFRATEL","BRITANNIA","CIPLA","COALINDIA","DIVISLAB","DRREDDY","EICHERMOT","GRASIM","HCLTECH",
-    "HDFCBANK","HDFC","HDFCLIFE","HEROMOTOCO","HINDALCO","HINDUNILVR","ICICIBANK","ITC","JSWSTEEL",
-    "KOTAKBANK","LT","MARUTI","NTPC","ONGC","POWERGRID","RELIANCE","SBILIFE","SBIN","SUNPHARMA",
-    "TATASTEEL","TCS","TECHM","TITAN","ULTRACEMCO","UPL","WIPRO","DIVISLAB"  # note: DIVISLAB duplicated earlier, it's OK
+    "RELIANCE","TCS","HDFCBANK","INFY","HDFC","ICICIBANK","KOTAKBANK","SBIN","AXISBANK","LT",
+    "ITC","BHARTIARTL","HINDUNILVR","HINDALCO","NTPC","ONGC","POWERGRID","MARUTI","SUNPHARMA",
+    "BAJFINANCE","BAJAJ-AUTO","BAJAJFINSV","BRITANNIA","CIPLA","COALINDIA","DRREDDY","EICHERMOT",
+    "GRASIM","HCLTECH","HDFCLIFE","HEROMOTOCO","JSWSTEEL","ULTRACEMCO","TATASTEEL","TECHM","TITAN",
+    "UPL","WIPRO","ADANIENT","ASIANPAINT"
 ]
-# Note: ticker naming conventions differ; Upstox trading_symbol may be exact like 'TCS', 'RELIANCE', 'HDFCBANK', etc.
-# If some not found, prefer providing NIFTY50_TICKERS env var.
 
 # parse NIFTY tickers
 if NIFTY50_TICKERS_RAW:
@@ -103,7 +87,6 @@ def send_telegram_message(text):
         return False
 
 def download_upstox_instruments():
-    """Download Upstox instruments CSV (gz) and return list of dict rows."""
     logging.info("Downloading Upstox instruments CSV (this may be large)...")
     try:
         r = requests.get(UPSTOX_INSTRUMENTS_CSV_GZ, timeout=60)
@@ -123,22 +106,16 @@ def download_upstox_instruments():
         return []
 
 def build_symbol_to_instrument_key_map(rows):
-    """
-    Build mapping from trading_symbol (upper) -> instrument_key
-    Also try other fields if available.
-    """
     mapping = {}
     for row in rows:
-        # common column names: 'trading_symbol','instrument_key','symbol','instrumentKey'
         ts = (row.get('trading_symbol') or row.get('symbol') or row.get('tradingSymbol') or "").strip()
         ik = (row.get('instrument_key') or row.get('instrumentKey') or row.get('instrument_token') or row.get('token') or "").strip()
+        name = (row.get('name') or row.get('instrument_name') or "").strip()
         if ts and ik:
             mapping[ts.upper()] = ik
-        # sometimes name field contains index names like 'Nifty 50' - we won't use that here
     return mapping
 
 def find_instrument_keys_for_tickers(tickers, mapping):
-    """Given tickers list and mapping trading_symbol->instrument_key, return instrument_key list and a dict of unmatched tickers."""
     keys = []
     unmatched = []
     for t in tickers:
@@ -146,10 +123,14 @@ def find_instrument_keys_for_tickers(tickers, mapping):
         if ik:
             keys.append(ik)
         else:
-            unmatched.append(t)
+            # heuristics: try simple variants
+            alt = t.upper().replace("&","AND").replace(".","").replace("-","").strip()
+            if alt in mapping:
+                keys.append(mapping[alt])
+            else:
+                unmatched.append(t)
     return keys, unmatched
 
-# Reuse robust parsing & formatting functions (similar to earlier versions)
 def find_ltp_in_obj(obj):
     if obj is None:
         return None
@@ -237,7 +218,6 @@ def get_ltps_for_keys(keys):
     if not keys:
         return None
     headers = {"Accept": "application/json", "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}"}
-    # join keys with comma - encode
     key_param = ",".join(keys)
     url = UPSTOX_LTP_URL + "?instrument_key=" + quote_plus(key_param)
     try:
@@ -290,7 +270,6 @@ def format_message_and_decide_send(parsed_list):
                     diff_pct = abs((ltp_f - prev) / prev) * 100.0
                 should_send = diff_pct >= CHANGE_THRESHOLD_PCT
 
-        # update LAST_LTPS
         if ltp_f is not None:
             LAST_LTPS[key] = ltp_f
 
@@ -306,7 +285,6 @@ def format_message_and_decide_send(parsed_list):
 
 # -------------- Startup: build instrument key list --------------
 def build_instrument_keys():
-    # 1) download Upstox instruments CSV and build mapping
     rows = download_upstox_instruments()
     if not rows:
         logging.error("Could not download instrument rows; will only use EXPLICIT_INSTRUMENT_KEYS if provided.")
@@ -314,7 +292,6 @@ def build_instrument_keys():
     else:
         mapping = build_symbol_to_instrument_key_map(rows)
 
-    # 2) find keys for NIFTY50 tickers
     keys = []
     if NIFTY50_TICKERS:
         mapped_keys, unmatched = find_instrument_keys_for_tickers(NIFTY50_TICKERS, mapping)
@@ -322,16 +299,14 @@ def build_instrument_keys():
             keys.extend(mapped_keys)
             logging.info("Mapped %d Nifty50 tickers to instrument_keys, %d unmatched", len(mapped_keys), len(unmatched))
             if unmatched:
-                logging.info("Unmatched tickers (may require exact ticker names for Upstox): %s", ", ".join(unmatched))
+                logging.info("Unmatched tickers (may require exact trading_symbol names for Upstox): %s", ", ".join(unmatched))
         else:
             logging.warning("No Nifty50 tickers mapped - unmatched or mapping empty. Provide NIFTY50_TICKERS env with exact trading symbols or add EXPLICIT_INSTRUMENT_KEYS.")
 
-    # 3) include any explicit keys
     if EXPLICIT_KEYS:
         keys.extend(EXPLICIT_KEYS)
         logging.info("Included %d explicit instrument keys", len(EXPLICIT_KEYS))
 
-    # dedupe while preserving order
     seen = set()
     deduped = []
     for k in keys:
@@ -348,10 +323,7 @@ def main():
         logging.error("No instrument keys available to poll. Exiting.")
         return
 
-    # For large lists, Upstox endpoint may accept many keys; if too long, you may need to chunk.
-    # We'll chunk to batches of 50 keys per request as a safe default.
     CHUNK_SIZE = 50
-
     logging.info("Starting poller. Poll interval: %ds. Threshold pct: %s", POLL_INTERVAL, CHANGE_THRESHOLD_PCT)
     while True:
         try:
@@ -363,12 +335,9 @@ def main():
                     logging.warning("No response for chunk %d-%d", i, i+len(chunk)-1)
                     continue
                 parsed = parse_upstox_response(resp)
-                # ensure parsed items include instrument_key for items in this chunk (Upstox may return mapping)
-                # If parsed items don't have instrument_key, attach from chunk best-effort
                 if parsed:
                     for it in parsed:
                         if not it.get('instrument_key'):
-                            # try to set from trading_symbol match or chunk keys
                             if it.get('trading_symbol'):
                                 it['instrument_key'] = it['trading_symbol']
                             else:

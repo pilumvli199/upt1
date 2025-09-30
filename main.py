@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Robust Upstox -> Telegram LTP poller (fixed logging)
-- Handles multiple Upstox response shapes
-- Proper logging format & datefmt to avoid ValueError
+More-robust Upstox -> Telegram LTP poller
+- Aggressively searches nested responses to find LTP values
+- Handles mapping instrument_key -> payload, list payloads, 'data' shapes, etc.
+- Logs raw Upstox response to container logs when parsing fails (NOT to Telegram)
 """
 import os
 import time
@@ -11,7 +12,6 @@ import requests
 import html
 from urllib.parse import quote_plus
 
-# Correct logging setup: use %(asctime)s in format and datefmt for datetime formatting.
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)s %(message)s',
@@ -70,37 +70,119 @@ def send_telegram_message(text):
 def safe_name(key_or_symbol):
     return INSTRUMENT_NAME_MAP.get(key_or_symbol, key_or_symbol)
 
+def find_ltp_in_obj(obj):
+    """
+    Recursively search obj (dict/list/scalar) for an LTP-like value.
+    Returns the first found value (as-is) or None.
+    Keys considered: 'ltp','last_traded_price','lastPrice','ltpPrice','lastPriceValue'
+    """
+    if obj is None:
+        return None
+    # if it's a dict, look for direct keys first
+    if isinstance(obj, dict):
+        for key in ('ltp','last_traded_price','lastPrice','ltpPrice','lastPriceValue','lastTradedPrice'):
+            if key in obj and obj[key] is not None:
+                return obj[key]
+        # try numeric-looking keys or nested fields
+        for k, v in obj.items():
+            # skip if k looks like metadata
+            if isinstance(v, (dict, list)):
+                val = find_ltp_in_obj(v)
+                if val is not None:
+                    return val
+            else:
+                # if value is numeric-like (int/float/str of digits with dot)
+                if isinstance(v, (int, float)):
+                    # heuristics: value likely > 1 and reasonable
+                    if v != 0:
+                        return v
+                if isinstance(v, str):
+                    s = v.strip().replace(',', '')
+                    # simple float test
+                    try:
+                        f = float(s)
+                        return f
+                    except Exception:
+                        pass
+        return None
+    elif isinstance(obj, list):
+        for el in obj:
+            val = find_ltp_in_obj(el)
+            if val is not None:
+                return val
+        return None
+    else:
+        # scalar
+        if isinstance(obj, (int, float)):
+            return obj
+        if isinstance(obj, str):
+            s = obj.strip().replace(',', '')
+            try:
+                return float(s)
+            except Exception:
+                return None
+        return None
+
 def parse_upstox_response(resp):
-    items = []
+    """
+    Return list of parsed dicts: {'instrument_key', 'trading_symbol', 'ltp', 'change_percent'}
+    Aggressively handle: {'data':...}, list, mapping instrument_key->payload, nested shapes.
+    """
+    parsed = []
+
     if resp is None:
-        return items
+        return parsed
+
+    # If resp has top-level 'data'
     if isinstance(resp, dict) and 'data' in resp:
         data = resp['data']
-        if isinstance(data, list):
+        # if data itself is mapping instrument_key->payload
+        if isinstance(data, dict):
+            # iterate keys
+            for k, v in data.items():
+                ltp = find_ltp_in_obj(v)
+                # try to find trading symbol within v
+                ts = None
+                if isinstance(v, dict):
+                    ts = v.get('trading_symbol') or v.get('symbol') or v.get('instrument_name') or None
+                parsed.append({'instrument_key': k, 'trading_symbol': ts or k, 'ltp': ltp, 'change_percent': None})
+            return parsed
+        elif isinstance(data, list):
             items = data
-        elif isinstance(data, dict):
+        else:
             items = [data]
+    elif isinstance(resp, dict):
+        # maybe mapping instrument_key -> payload at top level
+        instrument_like_items = []
+        for k, v in resp.items():
+            if isinstance(v, dict) and any(x in v for x in ['ltp','last_traded_price','lastPrice']) or isinstance(v, (dict, list)):
+                # treat as payload for k
+                ltp = find_ltp_in_obj(v)
+                ts = v.get('trading_symbol') if isinstance(v, dict) else None
+                instrument_like_items.append({'instrument_key': k, 'trading_symbol': ts or k, 'ltp': ltp, 'change_percent': None})
+        if instrument_like_items:
+            parsed.extend(instrument_like_items)
+            return parsed
+        # else maybe resp itself is a single payload with ltp fields
+        items = [resp]
     elif isinstance(resp, list):
         items = resp
-    elif isinstance(resp, dict):
-        for k, v in resp.items():
-            if isinstance(v, dict) and any(x in v for x in ['ltp', 'last_traded_price', 'lastPrice']):
-                payload = dict(v)
-                payload.setdefault('instrument_key', k)
-                items.append(payload)
-        if not items and any(x in resp for x in ['ltp', 'last_traded_price', 'lastPrice']):
-            items = [resp]
-    parsed = []
+    else:
+        items = [resp]
+
+    # normalize items (list of dicts)
     for it in items:
         if not isinstance(it, dict):
+            # if scalar or unknown, skip
             continue
-        ik = it.get('instrument_key') or it.get('instrumentKey') or it.get('instrumentToken') or it.get('token') or it.get('symbol')
-        ts = (it.get('trading_symbol') or it.get('symbol') or ik or "").strip()
-        ltp = it.get('ltp') or it.get('last_traded_price') or it.get('lastPrice') or it.get('ltpPrice') or None
-        change = it.get('change_percent') or it.get('percent_change') or it.get('change') or None
+        ik = it.get('instrument_key') or it.get('instrumentKey') or None
+        # if ik not present, maybe key present inside object under some known key
+        ts = (it.get('trading_symbol') or it.get('symbol') or it.get('instrument_name') or None)
+        ltp = find_ltp_in_obj(it)
+        change = it.get('change_percent') or it.get('percent_change') or None
         parsed.append({
-            'instrument_key': ik or ts,
-            'trading_symbol': ts or ik,
+            'instrument_key': ik or ts or None,
+            'trading_symbol': ts or ik or None,
             'ltp': ltp,
             'change_percent': change
         })
@@ -110,10 +192,7 @@ def format_message(parsed_list, raw_resp=None):
     ts = time.strftime('%Y-%m-%d %H:%M:%S')
     lines = [f"<b>Upstox LTP Update</b> — {ts}"]
     if not parsed_list:
-        lines.append("No LTPs parsed from response. Raw response logged on server.")
-        if raw_resp is not None:
-            snippet = html.escape(str(raw_resp))[:600]
-            lines.append(f"<pre>{snippet}</pre>")
+        lines.append("No LTPs parsed from response. Check container logs (RAW_UPSTOX).")
         return "\n".join(lines)
     for p in parsed_list:
         name = p.get('trading_symbol') or p.get('instrument_key') or 'UNKNOWN'
@@ -121,13 +200,13 @@ def format_message(parsed_list, raw_resp=None):
         ltp = p.get('ltp')
         change = p.get('change_percent')
         if ltp is None:
-            line = f"{html.escape(name)}: NA"
+            line = f"{html.escape(str(name))}: NA"
         else:
             ltp_s = html.escape(str(ltp))
             if change:
-                line = f"{html.escape(name)}: {ltp_s} ({html.escape(str(change))}%)"
+                line = f"{html.escape(str(name))}: {ltp_s} ({html.escape(str(change))}%)"
             else:
-                line = f"{html.escape(name)}: {ltp_s}"
+                line = f"{html.escape(str(name))}: {ltp_s}"
         lines.append(line)
     return "\n".join(lines)
 
@@ -141,11 +220,16 @@ def main():
             send_telegram_message(msg)
             time.sleep(POLL_INTERVAL)
             continue
+
         parsed = parse_upstox_response(resp)
-        if not parsed:
-            logging.warning("Parsed list empty — logging raw response for debugging.")
-            logging.info("RAW_UPSTOX: %s", str(resp)[:2000])
-            msg = format_message([], raw_resp=resp)
+        if not parsed or all(p.get('ltp') is None for p in parsed):
+            logging.warning("Parsed list empty or LTP missing — logging raw response for debugging.")
+            # log raw response to container logs (not to telegram)
+            try:
+                logging.info("RAW_UPSTOX: %s", str(resp)[:4000])
+            except Exception:
+                logging.info("RAW_UPSTOX: (failed to stringify)")
+            msg = format_message(parsed, raw_resp=None)
             send_telegram_message(msg)
         else:
             msg = format_message(parsed, raw_resp=None)

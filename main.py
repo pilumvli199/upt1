@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """
-Upstox -> Telegram LTP poller for Nifty50 members (full)
+Validated Upstox -> Telegram LTP poller (full)
 
-Use:
-- Copy this file as main.py
-- Fill .env (see .env.example)
-- pip install requests
-- python main.py
+Behavior:
+- Loads instrument keys from EXPLICIT_INSTRUMENT_KEYS (or maps NIFTY50_TICKERS via instruments CSV)
+- Validates each instrument_key at startup by issuing a single-key LTP request
+  - Keeps only keys that return a valid 200 response format (or at least not 400)
+  - Removes invalid keys so the main poll loop won't fail with 400 Bad Request
+- If token is invalid (401) it exits with a helpful error
+- Polls remaining keys in chunks, parses LTPs, and sends Telegram messages only on change (threshold)
+- Logs RAW_UPSTOX responses in container logs for debugging (does NOT send raw to Telegram)
+Env required:
+- UPSTOX_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+Optional:
+- EXPLICIT_INSTRUMENT_KEYS (comma-separated instrument_key values)
+- NIFTY50_TICKERS (comma-separated trading symbols to map via instruments CSV)
+- POLL_INTERVAL, CHANGE_THRESHOLD_PCT, SEND_ALL_EVERY_POLL
 """
 import os
 import time
@@ -18,14 +27,14 @@ import csv
 import html
 from urllib.parse import quote_plus
 
-# -------------- Logging --------------
+# ---------- Logging ----------
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)s %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-# -------------- Config from env --------------
+# ---------- Config ----------
 UPSTOX_ACCESS_TOKEN = os.getenv('UPSTOX_ACCESS_TOKEN')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
@@ -34,16 +43,16 @@ POLL_INTERVAL = int(os.getenv('POLL_INTERVAL') or 60)
 CHANGE_THRESHOLD_PCT = float(os.getenv('CHANGE_THRESHOLD_PCT') or 0.0)
 SEND_ALL_EVERY_POLL = os.getenv('SEND_ALL_EVERY_POLL', 'false').lower() in ('1','true','yes')
 
-NIFTY50_TICKERS_RAW = os.getenv('NIFTY50_TICKERS')  # comma separated trading symbols you want to map
-EXPLICIT_INSTRUMENT_KEYS = os.getenv('EXPLICIT_INSTRUMENT_KEYS')  # comma separated instrument_keys to poll directly
+NIFTY50_TICKERS_RAW = os.getenv('NIFTY50_TICKERS')  # optional
+EXPLICIT_INSTRUMENT_KEYS = os.getenv('EXPLICIT_INSTRUMENT_KEYS')  # optional
 
-INSTRUMENT_NAME_MAP_RAW = os.getenv('INSTRUMENT_NAME_MAP') or ""  # e.g. "NSE_EQ|INE467B01029:TCS,..."
+INSTRUMENT_NAME_MAP_RAW = os.getenv('INSTRUMENT_NAME_MAP') or ""
 
 if not UPSTOX_ACCESS_TOKEN or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     logging.error("Missing required env vars: UPSTOX_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID")
     raise SystemExit(1)
 
-# Default common Nifty50 tickers (best-effort). Override via NIFTY50_TICKERS env if needed.
+# ---------- Defaults ----------
 DEFAULT_NIFTY50_TICKERS = [
     "RELIANCE","TCS","HDFCBANK","INFY","HDFC","ICICIBANK","KOTAKBANK","SBIN","AXISBANK","LT",
     "ITC","BHARTIARTL","HINDUNILVR","HINDALCO","NTPC","ONGC","POWERGRID","MARUTI","SUNPHARMA",
@@ -52,16 +61,13 @@ DEFAULT_NIFTY50_TICKERS = [
     "UPL","WIPRO","ADANIENT","ASIANPAINT"
 ]
 
-# parse NIFTY tickers
 if NIFTY50_TICKERS_RAW:
     NIFTY50_TICKERS = [t.strip() for t in NIFTY50_TICKERS_RAW.split(",") if t.strip()]
 else:
     NIFTY50_TICKERS = DEFAULT_NIFTY50_TICKERS
 
-# parse explicit instrument keys
 EXPLICIT_KEYS = [k.strip() for k in (EXPLICIT_INSTRUMENT_KEYS or "").split(",") if k.strip()]
 
-# parse friendly name map
 INSTRUMENT_NAME_MAP = {}
 for pair in [p.strip() for p in INSTRUMENT_NAME_MAP_RAW.split(",") if p.strip()]:
     if ":" in pair:
@@ -71,10 +77,10 @@ for pair in [p.strip() for p in INSTRUMENT_NAME_MAP_RAW.split(",") if p.strip()]
 UPSTOX_INSTRUMENTS_CSV_GZ = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
 UPSTOX_LTP_URL = "https://api.upstox.com/v3/market-quote/ltp"
 
-# -------------- State --------------
+# ---------- State ----------
 LAST_LTPS = {}  # key -> float
 
-# -------------- Helpers --------------
+# ---------- Helpers ----------
 def send_telegram_message(text):
     tg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
@@ -110,7 +116,6 @@ def build_symbol_to_instrument_key_map(rows):
     for row in rows:
         ts = (row.get('trading_symbol') or row.get('symbol') or row.get('tradingSymbol') or "").strip()
         ik = (row.get('instrument_key') or row.get('instrumentKey') or row.get('instrument_token') or row.get('token') or "").strip()
-        name = (row.get('name') or row.get('instrument_name') or "").strip()
         if ts and ik:
             mapping[ts.upper()] = ik
     return mapping
@@ -123,7 +128,6 @@ def find_instrument_keys_for_tickers(tickers, mapping):
         if ik:
             keys.append(ik)
         else:
-            # heuristics: try simple variants
             alt = t.upper().replace("&","AND").replace(".","").replace("-","").strip()
             if alt in mapping:
                 keys.append(mapping[alt])
@@ -224,6 +228,12 @@ def get_ltps_for_keys(keys):
         r = requests.get(url, headers=headers, timeout=20)
         r.raise_for_status()
         return r.json()
+    except requests.exceptions.HTTPError as he:
+        # propagate status code information for validation logic
+        status = getattr(he.response, 'status_code', None)
+        body = getattr(he.response, 'text', '')
+        logging.warning("Upstox LTP fetch failed: %s %s", status, (body[:400] if body else ''))
+        raise
     except Exception as e:
         logging.warning("Upstox LTP fetch failed: %s", e)
         return None
@@ -283,40 +293,87 @@ def format_message_and_decide_send(parsed_list):
 
     return should_send_any or SEND_ALL_EVERY_POLL, "\n".join(lines)
 
-# -------------- Startup: build instrument key list --------------
+# ---------- Key validation helpers ----------
+def validate_single_key(key):
+    """Issue single-key request; return (valid:bool, reason:str). If 401, raise Exception."""
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}"}
+    url = UPSTOX_LTP_URL + "?instrument_key=" + quote_plus(key)
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            # quick sanity check: does body contain ltp or data?
+            text = r.text or ""
+            if '"data"' in text or '"ltp"' in text or 'last_traded_price' in text or 'lastPrice' in text:
+                return True, "OK"
+            else:
+                return True, "OK (no explicit ltp string found) "
+        elif r.status_code == 401:
+            return False, "401 Unauthorized"
+        else:
+            return False, f"{r.status_code} {r.text[:200]}"
+    except requests.exceptions.RequestException as e:
+        return False, str(e)
+
+def validate_and_filter_keys(keys):
+    """Validate each key and return a filtered list of valid keys. If 401 seen, exit."""
+    valid = []
+    bad = {}
+    logging.info("Validating %d instrument keys (this may take a few seconds)...", len(keys))
+    for k in keys:
+        ok, reason = validate_single_key(k)
+        if ok:
+            logging.info("Key valid: %s", k)
+            valid.append(k)
+        else:
+            logging.warning("Key invalid: %s -> %s", k, reason)
+            bad[k] = reason
+            if '401' in reason or 'Unauthorized' in reason or 'authentication' in reason.lower():
+                logging.error("Authentication failed while validating keys: %s", reason)
+                raise SystemExit("UPSTOX_ACCESS_TOKEN invalid/expired (401). Refresh token and retry.")
+    if bad:
+        logging.info("Filtered out %d invalid keys.", len(bad))
+    return valid, bad
+
+# ---------- Build instrument keys (map NIFTY tickers if needed) ----------
 def build_instrument_keys():
     rows = download_upstox_instruments()
-    if not rows:
-        logging.error("Could not download instrument rows; will only use EXPLICIT_INSTRUMENT_KEYS if provided.")
-        mapping = {}
-    else:
-        mapping = build_symbol_to_instrument_key_map(rows)
-
+    mapping = build_symbol_to_instrument_key_map(rows) if rows else {}
     keys = []
+    # map NIFTY tickers if requested
     if NIFTY50_TICKERS:
         mapped_keys, unmatched = find_instrument_keys_for_tickers(NIFTY50_TICKERS, mapping)
         if mapped_keys:
             keys.extend(mapped_keys)
             logging.info("Mapped %d Nifty50 tickers to instrument_keys, %d unmatched", len(mapped_keys), len(unmatched))
             if unmatched:
-                logging.info("Unmatched tickers (may require exact trading_symbol names for Upstox): %s", ", ".join(unmatched))
+                logging.info("Unmatched tickers (may require exact trading_symbol): %s", ", ".join(unmatched))
         else:
-            logging.warning("No Nifty50 tickers mapped - unmatched or mapping empty. Provide NIFTY50_TICKERS env with exact trading symbols or add EXPLICIT_INSTRUMENT_KEYS.")
+            logging.warning("No Nifty50 tickers mapped - mapping empty or unmatched.")
 
+    # include explicit keys
     if EXPLICIT_KEYS:
         keys.extend(EXPLICIT_KEYS)
         logging.info("Included %d explicit instrument keys", len(EXPLICIT_KEYS))
 
+    # dedupe
     seen = set()
     deduped = []
     for k in keys:
-        if k not in seen and k:
+        if k and k not in seen:
             deduped.append(k)
             seen.add(k)
-    logging.info("Total instrument_keys to poll: %d", len(deduped))
-    return deduped
+    logging.info("Total candidate instrument_keys: %d", len(deduped))
+    # validate keys so we remove bad ones before polling
+    if deduped:
+        valid, bad = validate_and_filter_keys(deduped)
+        if not valid:
+            logging.error("No valid instrument keys after validation. Exiting.")
+            return []
+        return valid
+    else:
+        return []
 
-# -------------- Main loop --------------
+# ---------- Main loop ----------
 def main():
     instrument_keys = build_instrument_keys()
     if not instrument_keys:
@@ -324,13 +381,34 @@ def main():
         return
 
     CHUNK_SIZE = 50
-    logging.info("Starting poller. Poll interval: %ds. Threshold pct: %s", POLL_INTERVAL, CHANGE_THRESHOLD_PCT)
+    logging.info("Starting poller. Poll interval: %ds. Threshold pct: %s. Polling %d keys.", POLL_INTERVAL, CHANGE_THRESHOLD_PCT, len(instrument_keys))
     while True:
         try:
             all_parsed = []
             for i in range(0, len(instrument_keys), CHUNK_SIZE):
                 chunk = instrument_keys[i:i+CHUNK_SIZE]
-                resp = get_ltps_for_keys(chunk)
+                try:
+                    resp = get_ltps_for_keys(chunk)
+                except Exception:
+                    # if chunk caused a HTTPError (eg 400 due to malformed key), try to individually validate and remove offending key
+                    logging.warning("Chunk request failed - trying single-key diagnostics for this chunk.")
+                    # test each key individually to find bad ones and remove them
+                    new_chunk = []
+                    for k in chunk:
+                        ok, reason = validate_single_key(k)
+                        if ok:
+                            new_chunk.append(k)
+                        else:
+                            logging.warning("Removing bad key from polling list: %s -> %s", k, reason)
+                            if '401' in reason or 'Unauthorized' in reason:
+                                logging.error("Authentication failure while polling; exiting.")
+                                raise SystemExit("UPSTOX_ACCESS_TOKEN invalid/expired (401). Refresh token and retry.")
+                    # update global instrument_keys to remove bad keys permanently
+                    instrument_keys = [x for x in instrument_keys if x in new_chunk or x not in chunk]
+                    if not new_chunk:
+                        logging.warning("No valid keys left in this chunk after diagnostics.")
+                        continue
+                    resp = get_ltps_for_keys(new_chunk)
                 if resp is None:
                     logging.warning("No response for chunk %d-%d", i, i+len(chunk)-1)
                     continue
